@@ -1,5 +1,6 @@
-const CONTENT_SCRIPT_VERSION = "2026.07.06-no-response-timeout";
+const CONTENT_SCRIPT_VERSION = "2026.07.16-gemini-auto-research";
 const HOSTNAME = window.location.hostname;
+const GEMINI_RESEARCH_FINAL_QUIET_MS = 10_000;
 
 console.info("[AI Bridge] content script loaded", HOSTNAME, CONTENT_SCRIPT_VERSION);
 
@@ -79,6 +80,12 @@ async function streamResponse({ id, source, baselineText, baselineInfo, promptTe
   let latestText = "";
   const startedAt = Date.now();
   let lastWaitLogAt = 0;
+  let geminiResearchStarted = false;
+  let geminiResearchPlanText = "";
+  let geminiResearchClickedAt = 0;
+  let geminiResearchClickAttempts = 0;
+  let geminiResearchSawActivity = false;
+  let geminiResearchSawPostClickText = false;
   
   let lastActivityAt = Date.now();
   const observer = new MutationObserver(() => {
@@ -166,12 +173,84 @@ async function streamResponse({ id, source, baselineText, baselineInfo, promptTe
         continue;
       }
 
+      if (source === "gemini" && !geminiResearchStarted) {
+        const startResearchButton = findGeminiStartResearchButton();
+        if (startResearchButton) {
+          geminiResearchStarted = true;
+          geminiResearchPlanText = currentText;
+          geminiResearchClickedAt = Date.now();
+          geminiResearchClickAttempts = 1;
+          lastActivityAt = geminiResearchClickedAt;
+          lastTextChangedAt = geminiResearchClickedAt;
+
+          startResearchButton.scrollIntoView({ block: "center", inline: "nearest" });
+          startResearchButton.click();
+          emitStatus(
+            id,
+            source,
+            "content.research_started",
+            "Gemini research plan detected; clicked Start Research",
+          );
+          await delay(750);
+          continue;
+        }
+      }
+
       const generating = isGenerating(source);
+      if (source === "gemini" && geminiResearchStarted) {
+        const researchRunning = isGeminiResearchRunning();
+        const startResearchButton = findGeminiStartResearchButton();
+        if (
+          startResearchButton &&
+          !generating &&
+          !researchRunning &&
+          Date.now() - geminiResearchClickedAt >= 1_500
+        ) {
+          if (geminiResearchClickAttempts >= 3) {
+            throw new Error("Gemini Start Research button did not activate");
+          }
+          geminiResearchClickAttempts += 1;
+          geminiResearchClickedAt = Date.now();
+          lastActivityAt = geminiResearchClickedAt;
+          startResearchButton.click();
+          emitStatus(
+            id,
+            source,
+            "content.research_start_retry",
+            `Retrying Start Research click (${geminiResearchClickAttempts}/3)`,
+          );
+          await delay(750);
+          continue;
+        }
+        if (
+          generating ||
+          researchRunning ||
+          (Date.now() - geminiResearchClickedAt >= 1_000 && lastActivityAt > geminiResearchClickedAt)
+        ) {
+          geminiResearchSawActivity = true;
+        }
+        if (
+          currentText &&
+          normalizeText(currentText) !== normalizeText(geminiResearchPlanText)
+        ) {
+          geminiResearchSawPostClickText = true;
+        }
+
+        if (!geminiResearchSawActivity || !geminiResearchSawPostClickText || researchRunning) {
+          await delay(500);
+          continue;
+        }
+      }
+
       if (currentText && !generating) {
-        const quietForMs = Date.now() - Math.max(lastActivityAt, lastTextChangedAt);
+        const quietForMs = source === "gemini" && geminiResearchStarted
+          ? Date.now() - lastTextChangedAt
+          : Date.now() - Math.max(lastActivityAt, lastTextChangedAt);
         const requiredQuietMs = source === "claude"
           ? getClaudeRequiredQuietMs()
-          : 1_250;
+          : source === "gemini" && geminiResearchStarted
+            ? GEMINI_RESEARCH_FINAL_QUIET_MS
+            : 1_250;
         if (quietForMs >= requiredQuietMs) {
           emitStatus(id, source, "content.stable", "Response considered stable");
           emitFinalIfNeeded(id, source, lastText || latestText);
@@ -414,6 +493,50 @@ function findSendButton(source) {
   }
 
   return undefined;
+}
+
+function findGeminiStartResearchButton() {
+  const labelPattern = /^(?:start research|начать исследование)$/i;
+  const controls = [...document.querySelectorAll("button, [role='button']")];
+  return controls.find((control) => {
+    if (!isVisible(control)) {
+      return false;
+    }
+    if (control.disabled || control.getAttribute("aria-disabled") === "true") {
+      return false;
+    }
+    return controlLabels(control).some((label) => labelPattern.test(label));
+  });
+}
+
+function isGeminiResearchRunning() {
+  const stopResearchPattern = /(?:stop|cancel).{0,24}research|(?:останов|прекрат|отмен).{0,24}исслед/i;
+  const controls = [...document.querySelectorAll("button, [role='button']")];
+  if (
+    controls.some((control) => (
+      isVisible(control) &&
+      controlLabels(control).some((label) => stopResearchPattern.test(label))
+    ))
+  ) {
+    return true;
+  }
+
+  return Boolean(firstVisible([
+    "model-response [aria-busy='true']",
+    "model-response [role='progressbar']",
+    "model-response mat-progress-spinner",
+    "model-response mat-spinner",
+    "model-response [class*='progress-spinner']",
+  ]));
+}
+
+function controlLabels(control) {
+  return [
+    control.getAttribute("aria-label"),
+    control.getAttribute("title"),
+    control.innerText,
+    control.textContent,
+  ].map((value) => normalizeText(value || "")).filter(Boolean);
 }
 
 function dispatchEnter(input) {

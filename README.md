@@ -12,6 +12,8 @@ The project is independent of Makima, Tauri, and local model/voice runtimes.
 - `aibridge.broker` routes WebSocket messages by request ID.
 - `aibridge.client` streams browser responses back to the CLI.
 - `extension` injects prompts into supported sites and reads their responses.
+- Gemini research-plan cards are continued automatically by clicking
+  `Start Research` / `Начать исследование` and waiting for the research result.
 - the optional debate modules implement `ai debate` and write to `reports`.
 
 The broker listens only on loopback:
