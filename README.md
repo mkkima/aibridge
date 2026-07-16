@@ -14,6 +14,8 @@ The project is independent of Makima, Tauri, and local model/voice runtimes.
 - `extension` injects prompts into supported sites and reads their responses.
 - Gemini research-plan cards are continued automatically by clicking
   `Start Research` / `Начать исследование` and waiting for the research result.
+- Completed Gemini Research documents are parsed from the immersive report
+  view into headings, paragraphs, lists, quotes, tables, and code blocks.
 - the optional debate modules implement `ai debate` and write to `reports`.
 
 The broker listens only on loopback:

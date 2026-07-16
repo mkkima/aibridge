@@ -1,6 +1,7 @@
 const CONTENT_SCRIPT_VERSION = "2026.07.16-gemini-auto-research";
 const HOSTNAME = window.location.hostname;
 const GEMINI_RESEARCH_FINAL_QUIET_MS = 10_000;
+let lastGeminiResearchReportText = "";
 
 console.info("[AI Bridge] content script loaded", HOSTNAME, CONTENT_SCRIPT_VERSION);
 
@@ -565,6 +566,16 @@ function getLatestAssistantText(source) {
   if (source === "claude") {
     return getLatestClaudeAssistantText();
   }
+  if (source === "gemini") {
+    const researchReport = getGeminiResearchReportText();
+    if (researchReport) {
+      lastGeminiResearchReportText = researchReport;
+      return researchReport;
+    }
+    if (!findPromptInput("gemini") && lastGeminiResearchReportText) {
+      return lastGeminiResearchReportText;
+    }
+  }
 
   const selectorsBySource = {
     chatgpt: [
@@ -640,6 +651,130 @@ function getLatestAssistantText(source) {
 
   candidates.sort((left, right) => left.top - right.top);
   return candidates[candidates.length - 1].text;
+}
+
+function getGeminiResearchReportText() {
+  const explicitResearchSelectors = [
+    "deep-research-report",
+    "research-report",
+    "[data-test-id*='research-report' i]",
+    "[data-testid*='research-report' i]",
+    "[class*='research-report' i]",
+    "[class*='deep-research' i]",
+  ];
+  const genericDocumentSelectors = [
+    "article",
+    "[role='document']",
+    "main",
+  ];
+  const visiblePromptInput = findPromptInput("gemini");
+  const roots = [];
+
+  for (const selector of [...explicitResearchSelectors, ...genericDocumentSelectors]) {
+    let nodes = [];
+    try {
+      nodes = [...document.querySelectorAll(selector)];
+    } catch {
+      continue;
+    }
+    for (const node of nodes) {
+      if (!roots.includes(node) && isVisible(node)) {
+        roots.push(node);
+      }
+    }
+  }
+
+  const candidates = [];
+  for (const root of roots) {
+    const isExplicitResearchRoot = explicitResearchSelectors.some((selector) => {
+      try {
+        return root.matches(selector);
+      } catch {
+        return false;
+      }
+    });
+
+    // Normal Gemini chat keeps the composer visible. Generic article/main roots
+    // are accepted only in the immersive report view where the composer is gone.
+    if (visiblePromptInput && !isExplicitResearchRoot) {
+      continue;
+    }
+
+    const headingCount = root.querySelectorAll("h1, h2, h3, h4").length;
+    const paragraphCount = root.querySelectorAll("p, li, pre, blockquote").length;
+    const text = extractGeminiResearchReportText(root);
+    if (text.length < 600 || headingCount < 1 || paragraphCount < 3) {
+      continue;
+    }
+
+    const semanticBonus = isExplicitResearchRoot
+      ? 5_000
+      : root.matches("article, [role='document']")
+        ? 2_000
+        : 0;
+    candidates.push({
+      text,
+      score: semanticBonus + text.length + headingCount * 300 + paragraphCount * 25,
+    });
+  }
+
+  candidates.sort((left, right) => right.score - left.score);
+  return candidates[0]?.text || "";
+}
+
+function extractGeminiResearchReportText(root) {
+  const blockSelectors = "h1, h2, h3, h4, h5, h6, p, li, pre, blockquote, td, th";
+  const blocks = getTopLevelElements([...root.querySelectorAll(blockSelectors)].filter((node) => (
+    isVisible(node) &&
+    !isGeminiResearchNoiseNode(node) &&
+    !node.querySelector(blockSelectors)
+  ))).sort(compareDocumentOrder);
+
+  const texts = blocks.map((node) => {
+    const text = cleanupGeminiResearchText(node.innerText || node.textContent || "");
+    if (!text) {
+      return "";
+    }
+    if (/^H[1-6]$/.test(node.tagName)) {
+      const level = Number(node.tagName.slice(1));
+      return `${"#".repeat(level)} ${text}`;
+    }
+    if (node.tagName === "LI") {
+      return `- ${text}`;
+    }
+    if (node.tagName === "PRE") {
+      return `\`\`\`\n${text}\n\`\`\``;
+    }
+    return text;
+  }).filter(Boolean);
+
+  if (texts.length > 0) {
+    return dedupeClaudeTextBlocks(texts).join("\n\n");
+  }
+
+  return cleanupGeminiResearchText(root.innerText || root.textContent || "");
+}
+
+function isGeminiResearchNoiseNode(node) {
+  return Boolean(
+    node.closest("nav, button, [role='button'], [role='toolbar'], [role='menu']") ||
+    node.closest("form, fieldset, textarea, input, [contenteditable='true']") ||
+    node.closest("[aria-hidden='true'], [hidden], .sr-only"),
+  );
+}
+
+function cleanupGeminiResearchText(text) {
+  return normalizeText(
+    text
+      .replace(/\r\n?/g, "\n")
+      .split(/\n+/)
+      .map((line) => line.trim())
+      .filter((line) => (
+        line &&
+        !/^(?:Создать|Create|Поделиться|Share|Экспортировать|Export|Ещё|More|Содержание|Contents)$/i.test(line)
+      ))
+      .join("\n"),
+  );
 }
 
 async function streamClaudeResponse({ id, baselineInfo, promptText }) {
