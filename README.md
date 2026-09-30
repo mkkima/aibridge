@@ -9,13 +9,17 @@ The project is independent of Makima, Tauri, and local model/voice runtimes.
 
 - `ai.cmd` and `aibridge.cli` provide the command-line interface.
 - `aibridge.lifecycle` starts the broker only when a command needs it.
-- `aibridge.broker` routes WebSocket messages by request ID.
+- `aibridge.broker` routes WebSocket messages by request ID and commits job
+  outcomes to a durable SQLite journal before reporting success.
 - `aibridge.client` streams browser responses back to the CLI.
 - `extension` injects prompts into supported sites and reads their responses.
 - Gemini research-plan cards are continued automatically by clicking
   `Start Research` / `Начать исследование` and waiting for the research result.
 - Completed Gemini Research documents are parsed from the immersive report
   view into headings, paragraphs, lists, quotes, tables, and code blocks.
+- When a new Gemini prompt arrives while an immersive Research report is open,
+  the extension closes it, opens a new chat, enables `Deep Research` from the
+  composer `+` menu, and only then submits the prompt.
 - the optional debate modules implement `ai debate` and write to `reports`.
 
 The broker listens only on loopback:
@@ -54,6 +58,7 @@ Makima extension. See `extension/README.md`.
 
 ```powershell
 ai "Explain this error" --chatgpt
+ai 'Explain this error' --claude
 ai --status
 ai "Compare these approaches" --chatgpt --gemini --claude
 ai --get-last --claude
@@ -61,9 +66,20 @@ ai --file .\prompt.txt --gemini
 ai debate "Choose an architecture"
 ```
 
+Inline prompts must be one argument enclosed in matching single or double
+quotes. Unquoted text and multiple positional fragments are rejected before the
+broker or any browser tab receives a request. Commands that do not carry inline
+text, such as `--status`, `--get-last`, and `--file`, continue to work normally.
+
 With no model flag, `ai` targets every supported source that currently has an
-open tab. Normal requests print a completion summary; `--get-last` prints the
-latest response from exactly one selected model.
+open tab. Normal requests print a completion summary; `--get-last` reads the
+latest visible assistant response directly from the selected model's open tab
+without submitting a new prompt.
+
+The journal is stored at `%LOCALAPPDATA%\AIBridge\data\jobs-v1.sqlite3` by
+default. Prompt bodies are represented by their SHA-256 digest and byte length;
+completed response bodies are stored in full so they survive broker and browser
+restarts. Set `AIBRIDGE_DB_PATH` to use another location.
 
 ## Configuration
 
@@ -73,6 +89,8 @@ The broker accepts these environment variables:
 - `AIBRIDGE_READY_TIMEOUT_SECONDS`, `AIBRIDGE_TASK_NAME`
 - `AIBRIDGE_MAX_MESSAGE_BYTES`, `AIBRIDGE_MAX_PENDING_REQUESTS`
 - `AIBRIDGE_PENDING_TTL_SECONDS`, `AIBRIDGE_QUIET`
+- `AIBRIDGE_DB_PATH`, `AIBRIDGE_JOB_TIMEOUT_SECONDS`
+- `AIBRIDGE_RESPONSE_TIMEOUT_SECONDS`, `AIBRIDGE_MAINTENANCE_INTERVAL_SECONDS`
 - `AIBRIDGE_WS_URL`, `AIBRIDGE_HTTP_URL` for CLI endpoint overrides
 
 The bundled extension currently uses the default loopback ports.

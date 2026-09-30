@@ -1,8 +1,10 @@
 import argparse
 import asyncio
-import sys
+import ctypes
+from dataclasses import dataclass
 import os
 import re
+import sys
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 if script_dir not in sys.path:
@@ -12,17 +14,13 @@ if script_dir not in sys.path:
 if os.name == 'nt':
     os.system('')
 
-from .client import CloudBridge, CloudBridgeConfig
+from .client import (
+    CLEAR_MARKER,
+    CloudBridge,
+    CloudBridgeConfig,
+    CloudBridgeError,
+)
 
-SECTION_HEADING_RE = re.compile(r"^[\wА-Яа-яЁё][\wА-Яа-яЁё\s/&,+-]{1,64}:?$")
-LEADING_BULLET_RE = re.compile(r"^\s*(?:[-*•◦○●]|\d+[.)])\s+")
-ACTION_STARTS = {
-    "анализировать", "выполнять", "готовить", "давать", "делать", "искать",
-    "извлекать", "обрабатывать", "объяснять", "обсуждать", "организовывать",
-    "отвечать", "переводить", "писать", "планировать", "помогать",
-    "проверять", "работать", "разбирать", "редактировать", "решать",
-    "сравнивать", "создавать", "составлять", "строить", "улучшать",
-}
 SOURCE_LABELS = {
     "chatgpt": "ChatGPT",
     "gemini": "Gemini",
@@ -35,103 +33,123 @@ SOURCE_GET_LAST_COMMANDS = {
 }
 DEFAULT_WS_URL = os.getenv("AIBRIDGE_WS_URL", "ws://127.0.0.1:8765")
 DEFAULT_HTTP_URL = os.getenv("AIBRIDGE_HTTP_URL", "http://127.0.0.1:8766")
+RAW_CLI_MODULE_RE = re.compile(
+    r'(?<!\S)-m\s+(?:"aibridge\.(?:cli|command)"|aibridge\.(?:cli|command))(?=\s|$)',
+    re.IGNORECASE,
+)
+VALUE_OPTIONS = {"--source", "--file", "--url", "--health-url"}
 
 
-def format_response_text(text: str) -> str:
-    lines = [line for line in normalize_response_lines(text) if line]
-    if not lines:
-        return ""
+@dataclass(frozen=True)
+class RawCliToken:
+    value: str
+    quote: str | None
 
-    output: list[str] = []
-    in_section = False
+
+@dataclass(frozen=True)
+class TextInvocation:
+    inline_prompt: str | None = None
+    is_debate: bool = False
+
+
+class CliSyntaxError(ValueError):
+    pass
+
+
+def get_raw_cli_arguments() -> str | None:
+    """Return the untouched argument tail used to start this Windows process."""
+    if os.name != "nt":
+        return None
+
+    try:
+        get_command_line = ctypes.windll.kernel32.GetCommandLineW
+        get_command_line.restype = ctypes.c_wchar_p
+        command_line = get_command_line()
+    except (AttributeError, OSError):
+        return None
+
+    if not command_line:
+        return None
+    module_match = RAW_CLI_MODULE_RE.search(command_line)
+    if not module_match:
+        return None
+    return command_line[module_match.end():].lstrip()
+
+
+def tokenize_raw_cli_arguments(raw_arguments: str) -> list[RawCliToken]:
+    """Split the CLI tail while treating both quote styles as delimiters."""
+    tokens: list[RawCliToken] = []
     index = 0
+    length = len(raw_arguments)
 
-    while index < len(lines):
-        line = lines[index]
-        next_line = lines[index + 1] if index + 1 < len(lines) else ""
-
-        if is_section_heading(line, next_line):
-            output.append(line.rstrip(":") + ":")
-            in_section = True
+    while index < length:
+        while index < length and raw_arguments[index].isspace():
             index += 1
-            continue
+        if index >= length:
+            break
 
-        if in_section and line:
-            output.append("  • " + strip_existing_bullet(line))
-        else:
-            output.append(line)
-        index += 1
+        token_start = index
+        outer_quote = raw_arguments[index] if raw_arguments[index] in {'"', "'"} else None
+        active_quote: str | None = None
+        outer_quote_closed = False
+        outer_quote_only = outer_quote is not None
+        value: list[str] = []
+        while index < length:
+            character = raw_arguments[index]
 
-    return "\n".join(trim_blank_edges(collapse_blank_lines(output)))
+            if active_quote is not None:
+                if character == "\\" and index + 1 < length and raw_arguments[index + 1] == active_quote:
+                    value.append(active_quote)
+                    index += 2
+                    continue
+                if character == active_quote:
+                    if active_quote == outer_quote and outer_quote_only:
+                        outer_quote_closed = True
+                    active_quote = None
+                    index += 1
+                    continue
+                value.append(character)
+                index += 1
+                continue
 
+            if character.isspace():
+                break
 
-def normalize_response_lines(text: str) -> list[str]:
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-    raw_lines = [re.sub(r"[ \t]+", " ", line).strip() for line in normalized.split("\n")]
-    lines: list[str] = []
+            quote_starts_group = character == '"' or (
+                character == "'"
+                and (index == token_start or (value and value[-1] == "="))
+            )
+            if quote_starts_group:
+                if index != token_start:
+                    outer_quote_only = False
+                active_quote = character
+                index += 1
+                continue
 
-    for line in raw_lines:
-        if not line:
-            if lines and lines[-1]:
-                lines.append("")
-            continue
-        lines.append(line)
+            if outer_quote_closed:
+                outer_quote_only = False
+            value.append(character)
+            index += 1
 
-    return trim_blank_edges(lines)
+        if active_quote is not None:
+            raise CliSyntaxError(
+                "Ошибка: обнаружена незакрытая кавычка; запрос не отправлен."
+            )
+        quote = outer_quote if outer_quote_only and outer_quote_closed else None
+        tokens.append(RawCliToken("".join(value), quote))
 
-
-def is_section_heading(line: str, next_line: str) -> bool:
-    if not line or not next_line:
-        return False
-    if LEADING_BULLET_RE.match(line):
-        return False
-    if len(line) > 72:
-        return False
-    if line.endswith((".", "!", "?", "…", ",")):
-        return False
-    if ":" in line and not line.endswith(":"):
-        return False
-    if is_action_line(line):
-        return False
-    word_count = len(line.rstrip(":").split())
-    return bool(SECTION_HEADING_RE.match(line.rstrip(":"))) and (line.endswith(":") or word_count <= 5)
-
-
-def is_action_line(line: str) -> bool:
-    first_word = line.rstrip(":").split(maxsplit=1)[0].casefold() if line.split() else ""
-    return first_word in ACTION_STARTS
-
-
-def strip_existing_bullet(line: str) -> str:
-    return LEADING_BULLET_RE.sub("", line).strip()
-
-
-def collapse_blank_lines(lines: list[str]) -> list[str]:
-    collapsed: list[str] = []
-    for line in lines:
-        if not line and (not collapsed or not collapsed[-1]):
-            continue
-        collapsed.append(line)
-    return collapsed
-
-
-def trim_blank_edges(lines: list[str]) -> list[str]:
-    while lines and not lines[0]:
-        lines.pop(0)
-    while lines and not lines[-1]:
-        lines.pop()
-    return lines
+    return tokens
 
 
 def clean_source_text(text: str, source: str | None = None) -> str:
-    cleaned = text.strip()
+    cleaned = text.replace("\r\n", "\n").replace("\r", "\n").strip()
     hidden_prefixes = ["Ответ Gemini", "Gemini response"]
     if source == "gemini":
         for prefix in hidden_prefixes:
             if cleaned.startswith(prefix):
                 cleaned = cleaned[len(prefix):].strip()
                 break
-    return format_response_text(cleaned)
+    return cleaned
 
 
 def normalize_source(source: str) -> str:
@@ -184,7 +202,10 @@ def token_text(token: str) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Send a prompt to browser-based AI through AI Bridge.")
+    parser = argparse.ArgumentParser(
+        description="Send a prompt to browser-based AI through AI Bridge.",
+        allow_abbrev=False,
+    )
     parser.add_argument("prompt", type=str, nargs="*", help="The prompt to send to the AI")
     parser.add_argument("--source", type=str, default=None, help="Specific source to target (legacy)")
     parser.add_argument("--chatgpt", action="store_true", help="Send to ChatGPT")
@@ -232,32 +253,169 @@ def validate_get_last_args(args: argparse.Namespace) -> int | None:
     return None
 
 
-def validate_without_bridge(argv: list[str] | None = None) -> int | None:
-    try:
-        args = build_parser().parse_args(argv)
-    except SystemExit as exc:
-        return int(exc.code or 0)
-    return validate_get_last_args(args)
+def positional_raw_tokens(tokens: list[RawCliToken]) -> list[RawCliToken]:
+    positionals: list[RawCliToken] = []
+    options_finished = False
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if options_finished:
+            positionals.append(token)
+            index += 1
+            continue
+
+        if token.quote is None and token.value == "--":
+            options_finished = True
+            index += 1
+            continue
+
+        if token.quote is None and token.value.startswith("--"):
+            option_name, separator, _option_value = token.value.partition("=")
+            if option_name in VALUE_OPTIONS and not separator:
+                index += 2
+            else:
+                index += 1
+            continue
+
+        positionals.append(token)
+        index += 1
+
+    return positionals
 
 
-async def wait_for_active_sources(bridge: CloudBridge, attempts: int = 40, delay: float = 0.5) -> list[str]:
-    for _ in range(attempts):
-        sources = await bridge.get_active_sources()
-        if sources:
-            return sources
-        await asyncio.sleep(delay)
-    return []
+def resolve_text_invocation(
+    args: argparse.Namespace,
+    raw_tokens: list[RawCliToken] | None,
+) -> TextInvocation:
+    if args.status or args.get_last:
+        return TextInvocation()
 
-async def main():
-    args = build_parser().parse_args()
-    get_last_validation_code = validate_get_last_args(args)
-    if get_last_validation_code is not None:
-        sys.exit(get_last_validation_code)
+    if raw_tokens is None:
+        if args.prompt:
+            raise CliSyntaxError(
+                "Ошибка: невозможно проверить кавычки исходной команды. "
+                "Запускайте запрос через ai.cmd; запрос не отправлен."
+            )
+        if args.file:
+            return TextInvocation()
+        raise CliSyntaxError(
+            "Ошибка: текст запроса не указан. Используйте текст в кавычках или --file <путь>."
+        )
+
+    positionals = positional_raw_tokens(raw_tokens)
+    first_is_debate = bool(
+        positionals
+        and positionals[0].quote is None
+        and positionals[0].value.casefold() == "debate"
+    )
+
+    if args.file:
+        if not positionals:
+            return TextInvocation()
+        if first_is_debate and len(positionals) == 1:
+            return TextInvocation(is_debate=True)
+        raise CliSyntaxError(
+            "Ошибка: укажите текст промта или --file, но не оба одновременно; запрос не отправлен."
+        )
+
+    if first_is_debate:
+        if len(positionals) != 2 or positionals[1].quote not in {'"', "'"}:
+            raise CliSyntaxError(
+                "Ошибка: тема дебатов должна быть целиком в одинарных или двойных кавычках. "
+                "Пример: ai debate \"тема\". Запрос не отправлен."
+            )
+        topic = positionals[1].value
+        if not topic.strip():
+            raise CliSyntaxError("Ошибка: тема для дебатов пуста; запрос не отправлен.")
+        return TextInvocation(inline_prompt=topic, is_debate=True)
+
+    if len(positionals) != 1 or positionals[0].quote not in {'"', "'"}:
+        raise CliSyntaxError(
+            "Ошибка: текстовый промпт должен быть одним аргументом в одинарных или двойных кавычках. "
+            "Правильно: ai \"hello\" или ai 'hello'. Без кавычек запрос не отправлен."
+        )
+
+    prompt = positionals[0].value
+    if not prompt.strip():
+        raise CliSyntaxError("Ошибка: текст запроса пуст; запрос не отправлен.")
+    return TextInvocation(inline_prompt=prompt)
+
+
+def parse_command_args(
+    argv: list[str] | None = None,
+    raw_arguments: str | None = None,
+) -> tuple[argparse.Namespace, list[RawCliToken] | None]:
+    raw_tokens = (
+        tokenize_raw_cli_arguments(raw_arguments)
+        if raw_arguments is not None
+        else None
+    )
+    parser_argv = [token.value for token in raw_tokens] if raw_tokens is not None else argv
+    return build_parser().parse_args(parser_argv), raw_tokens
+
+
+def validate_parsed_args(
+    args: argparse.Namespace,
+    raw_tokens: list[RawCliToken] | None,
+) -> tuple[int | None, TextInvocation | None]:
+    get_last_code = validate_get_last_args(args)
+    if get_last_code is not None:
+        return get_last_code, None
 
     if args.status:
         if args.file or args.prompt or target_sources_from_args(args) or args.get_last:
             print("Ошибка: --status нельзя сочетать с промптом или выбором модели.", file=sys.stderr)
-            sys.exit(1)
+            return 1, None
+        return None, TextInvocation()
+
+    try:
+        return None, resolve_text_invocation(args, raw_tokens)
+    except CliSyntaxError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2, None
+
+
+def validate_without_bridge(
+    argv: list[str] | None = None,
+    raw_arguments: str | None = None,
+) -> int | None:
+    try:
+        args, raw_tokens = parse_command_args(argv, raw_arguments)
+    except CliSyntaxError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    except SystemExit as exc:
+        return int(exc.code or 0)
+    validation_code, _invocation = validate_parsed_args(args, raw_tokens)
+    return validation_code
+
+
+async def wait_for_active_sources(
+    bridge: CloudBridge,
+    attempts: int = 40,
+    delay: float = 0.5,
+    required_source: str | None = None,
+) -> list[str]:
+    for _ in range(attempts):
+        sources = await bridge.get_active_sources()
+        if sources and (required_source is None or required_source in sources):
+            return sources
+        await asyncio.sleep(delay)
+    return []
+
+async def main(raw_arguments: str | None = None):
+    try:
+        args, raw_tokens = parse_command_args(sys.argv[1:], raw_arguments)
+    except CliSyntaxError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(2)
+
+    validation_code, invocation = validate_parsed_args(args, raw_tokens)
+    if validation_code is not None:
+        sys.exit(validation_code)
+    assert invocation is not None
+
+    if args.status:
         bridge = CloudBridge(
             CloudBridgeConfig(url=args.url, health_url=args.health_url)
         )
@@ -267,12 +425,37 @@ async def main():
         return
 
     if args.get_last:
-        prompt = ""
-    elif args.file:
-        if args.prompt and args.prompt[0].lower() != "debate":
-            print("Ошибка: укажите текст промта или --file, но не оба одновременно.", file=sys.stderr)
+        source = target_sources_from_args(args)[0]
+        bridge = CloudBridge(
+            CloudBridgeConfig(url=args.url, health_url=args.health_url)
+        )
+        sources = await wait_for_active_sources(bridge, required_source=source)
+        if source not in sources:
+            print(
+                f"{source_label(source)}: открытая вкладка с подключённым расширением не найдена.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        text = ""
+        try:
+            async for token in bridge.stream_current_tab(source):
+                chunk = token_text(token)
+                if token.startswith(CLEAR_MARKER):
+                    text = chunk
+                else:
+                    text += chunk
+        except CloudBridgeError as exc:
+            print(f"{source_label(source)}: ошибка: {exc}", file=sys.stderr)
             sys.exit(1)
 
+        cleaned = clean_source_text(text, source)
+        if not cleaned.strip():
+            print(f"{source_label(source)}: в открытой вкладке ответ не найден.", file=sys.stderr)
+            sys.exit(1)
+        print(cleaned)
+        return
+
+    if args.file:
         try:
             with open(args.file, "r", encoding="utf-8") as file:
                 prompt = file.read()
@@ -280,26 +463,11 @@ async def main():
             print(f"Ошибка при чтении файла {args.file}: {e}", file=sys.stderr)
             sys.exit(1)
     else:
-        prompt = " ".join(args.prompt)
-        if not prompt:
-            print("Ошибка: текст запроса не указан. Используйте текст или --file <путь>.", file=sys.stderr)
-            sys.exit(1)
+        assert invocation.inline_prompt is not None
+        prompt = invocation.inline_prompt
 
-    is_debate = False
-    debate_topic = ""
-    if args.prompt and args.prompt[0].lower() == "debate":
-        is_debate = True
-        if args.file:
-            if len(args.prompt) != 1:
-                print("Ошибка: для дебатов укажите тему или --file, но не оба одновременно.", file=sys.stderr)
-                sys.exit(1)
-            debate_topic = prompt
-        else:
-            debate_topic = " ".join(args.prompt[1:])
-        if not debate_topic:
-            print("Ошибка: тема для дебатов не указана. Используйте: ai debate <тема> или ai debate --file <путь>", file=sys.stderr)
-            sys.exit(1)
-        prompt = debate_topic
+    is_debate = invocation.is_debate
+    debate_topic = prompt if is_debate else ""
 
     config = CloudBridgeConfig(url=args.url, health_url=args.health_url)
     bridge = CloudBridge(config)
@@ -326,45 +494,33 @@ async def main():
         sys.exit(1)
 
     try:
-        async def collect_source(source, capture_text: bool):
-            text = ""
+        async def collect_source(source):
             saw_text = False
             try:
                 async for token in bridge.stream_completion(prompt, source=source):
                     chunk = token_text(token)
                     if chunk.strip():
                         saw_text = True
-                    if not capture_text:
-                        continue
-                    if token.startswith("\0CLEAR\0"):
-                        text = chunk
-                    else:
-                        text += chunk
-
-                cleaned = clean_source_text(text, source) if capture_text else ""
-                if not saw_text or (capture_text and not cleaned.strip()):
+                if not saw_text:
                     raise RuntimeError("ответ не получен")
-                return source, cleaned, None
+                return source, None
             except Exception as e:
-                return source, None, e
+                return source, e
 
         if len(target_sources) == 1:
-            source, text, err = await collect_source(target_sources[0], args.get_last)
+            source, err = await collect_source(target_sources[0])
             if err:
                 print(f"{source_label(source)}: ошибка: {err}", file=sys.stderr)
                 sys.exit(1)
-            elif args.get_last:
-                print(text)
-            else:
-                print_completion_summary([source])
+            print_completion_summary([source])
         else:
             # Multi-source mode: fetch concurrently but keep model outputs hidden.
-            tasks = [asyncio.create_task(collect_source(s, False)) for s in target_sources]
+            tasks = [asyncio.create_task(collect_source(s)) for s in target_sources]
             results = await asyncio.gather(*tasks)
             successful_sources = []
             missing_sources = []
 
-            for source, _text, err in results:
+            for source, err in results:
                 if err:
                     missing_sources.append((source, err))
                 else:
@@ -383,6 +539,6 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        asyncio.run(main(raw_arguments=get_raw_cli_arguments()))
     except KeyboardInterrupt:
         pass

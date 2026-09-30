@@ -1,14 +1,15 @@
 {
   "manifest_version": 3,
   "name": "AI Browser Bridge",
-  "version": "0.1.2",
+  "version": "0.1.17",
   "description": "Routes local ai commands to open ChatGPT, Gemini, or Claude tabs.",
-  "permissions": ["alarms", "tabs"],
+  "permissions": ["alarms", "tabs", "scripting"],
   "host_permissions": [
     "http://127.0.0.1/*",
     "ws://127.0.0.1/*",
     "https://chatgpt.com/*",
     "https://chat.openai.com/*",
+    "https://files.oaiusercontent.com/*",
     "https://gemini.google.com/*",
     "https://claude.ai/*"
   ],

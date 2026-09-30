@@ -3,12 +3,17 @@ from __future__ import annotations
 import asyncio
 import sys
 
-from .command import main as command_main, validate_without_bridge
+from .command import (
+    get_raw_cli_arguments,
+    main as command_main,
+    validate_without_bridge,
+)
 from .lifecycle import BridgeEnsureError, ensure_bridge
 
 
 async def run() -> int:
-    fast_exit_code = validate_without_bridge(sys.argv[1:])
+    raw_arguments = get_raw_cli_arguments()
+    fast_exit_code = validate_without_bridge(sys.argv[1:], raw_arguments=raw_arguments)
     if fast_exit_code is not None:
         return fast_exit_code
 
@@ -19,7 +24,7 @@ async def run() -> int:
         return 1
 
     try:
-        await command_main()
+        await command_main(raw_arguments=raw_arguments)
         return 0
     except SystemExit as exc:
         return int(exc.code or 0)
@@ -27,4 +32,3 @@ async def run() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(asyncio.run(run()))
-

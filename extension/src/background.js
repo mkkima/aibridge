@@ -5,6 +5,7 @@ const HEARTBEAT_INTERVAL_MS = 15_000;
 const BASE_RECONNECT_DELAY_MS = 500;
 const MAX_RECONNECT_DELAY_MS = 10_000;
 const MAX_OUTBOUND_QUEUE_SIZE = 200;
+const MAX_PROXIED_TEXT_FILE_BYTES = 4 * 1024 * 1024;
 const TARGET_HOSTS = {
   chatgpt: ["chatgpt.com", "chat.openai.com"],
   gemini: ["gemini.google.com"],
@@ -38,7 +39,27 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   void sendHeartbeat();
 });
 
-chrome.runtime.onMessage.addListener((message) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === "AIBRIDGE_INSPECT_CHATGPT_FILE") {
+    void inspectChatGptFileInMainWorld(message, sender)
+      .then((result) => sendResponse({ ok: true, ...result }))
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    return true;
+  }
+
+  if (message?.type === "AIBRIDGE_FETCH_CHATGPT_FILE") {
+    void proxyChatGptFileRequest(message, sender)
+      .then((result) => sendResponse({ ok: true, ...result }))
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    return true;
+  }
+
   if (!message || message.type !== "AIBRIDGE_COMPLETION_EVENT") {
     return false;
   }
@@ -46,6 +67,190 @@ chrome.runtime.onMessage.addListener((message) => {
   sendToBroker(message.payload);
   return false;
 });
+
+async function inspectChatGptFileInMainWorld(message, sender) {
+  if (sourceFromUrl(sender?.tab?.url) !== "chatgpt" || !sender?.tab?.id) {
+    throw new Error("ChatGPT file inspection is only available to a ChatGPT tab");
+  }
+  const fileName = String(message.fileName || "").trim();
+  if (!fileName || fileName.length > 500) {
+    throw new Error("ChatGPT file inspection requires a valid filename");
+  }
+
+  const results = await chrome.scripting.executeScript({
+    target: { tabId: sender.tab.id },
+    world: "MAIN",
+    func: inspectChatGptFileState,
+    args: [fileName],
+  });
+  return results?.[0]?.result || {};
+}
+
+function inspectChatGptFileState(fileName) {
+  const canonical = (value) => String(value || "")
+    .toLowerCase()
+    .replace(/^.*[\\/]/, "")
+    .replace(/[^a-z0-9а-яё]+/gi, "");
+  const expectedName = canonical(fileName);
+  const controls = [...document.querySelectorAll("button, [role='button'], a, [role='link']")]
+    .filter((node) => {
+      const text = String(node.innerText || node.textContent || "").trim();
+      return text && canonical(text).includes(expectedName);
+    });
+  const target = controls[controls.length - 1];
+  if (!target) {
+    return {};
+  }
+
+  const roots = [];
+  let element = target;
+  for (let depth = 0; element && depth < 7; depth += 1) {
+    for (const key of Object.getOwnPropertyNames(element)) {
+      if (/^__(?:react|next)/i.test(key)) {
+        try {
+          roots.push(element[key]);
+        } catch {
+          // Ignore inaccessible framework internals.
+        }
+      }
+    }
+    element = element.parentElement;
+  }
+
+  const fileIds = new Set();
+  const urls = new Set();
+  let content = "";
+  const seen = new WeakSet();
+  const queue = roots.map((value) => ({ value, depth: 0 }));
+  let inspected = 0;
+
+  while (queue.length > 0 && inspected < 12_000) {
+    const entry = queue.shift();
+    const value = entry.value;
+    if (!value || typeof value !== "object" || seen.has(value) || entry.depth > 10) {
+      continue;
+    }
+    seen.add(value);
+    inspected += 1;
+
+    let pairs = [];
+    try {
+      pairs = Object.entries(value);
+    } catch {
+      continue;
+    }
+    const stringPairs = pairs.filter(([_key, child]) => typeof child === "string");
+    const objectMentionsFile = stringPairs.some(([_key, child]) => (
+      canonical(child).includes(expectedName)
+    ));
+
+    for (const [key, child] of stringPairs) {
+      const text = String(child);
+      const idMatch = text.match(/(?:file-service|sediment):\/\/([a-z0-9_-]{12,})/i) ||
+        text.match(/\b(file[-_][a-z0-9_-]{10,})\b/i);
+      if (idMatch) {
+        fileIds.add(idMatch[1]);
+      }
+      if (
+        /^(?:https?:|sandbox:|blob:)/i.test(text) &&
+        (
+          canonical(text).includes(expectedName) ||
+          /\/backend-api\/files\/|oaiusercontent\.com/i.test(text)
+        )
+      ) {
+        urls.add(text);
+      }
+      if (
+        objectMentionsFile &&
+        /^(?:content|text|file_text|fileContent|contents)$/i.test(key) &&
+        text.length > 0 &&
+        text.length <= 4 * 1024 * 1024
+      ) {
+        content ||= text;
+      }
+    }
+
+    for (const [key, child] of pairs) {
+      if (/^(?:return|child|sibling|stateNode|alternate)$/i.test(key)) {
+        continue;
+      }
+      if (child && typeof child === "object" && !(child instanceof Element)) {
+        queue.push({ value: child, depth: entry.depth + 1 });
+      }
+    }
+  }
+
+  return {
+    fileIds: [...fileIds].slice(0, 20),
+    urls: [...urls].slice(0, 20),
+    content,
+  };
+}
+
+async function proxyChatGptFileRequest(message, sender) {
+  if (sourceFromUrl(sender?.tab?.url) !== "chatgpt") {
+    throw new Error("ChatGPT file proxy is only available to a ChatGPT tab");
+  }
+
+  const url = new URL(String(message.url || ""));
+  if (
+    url.protocol !== "https:" ||
+    !(
+      url.hostname === "files.oaiusercontent.com" ||
+      url.hostname.endsWith(".oaiusercontent.com")
+    )
+  ) {
+    throw new Error("ChatGPT file proxy rejected this host");
+  }
+
+  const headers = { Accept: "*/*" };
+  if (typeof message.accessToken === "string" && message.accessToken) {
+    headers.Authorization = `Bearer ${message.accessToken}`;
+  }
+  if (typeof message.accountId === "string" && message.accountId) {
+    headers["ChatGPT-Account-Id"] = message.accountId;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10_000);
+  try {
+    const response = await fetch(url.href, {
+      method: "GET",
+      cache: "no-store",
+      credentials: "omit",
+      headers,
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`file request returned HTTP ${response.status}`);
+    }
+
+    const declaredLength = Number(response.headers.get("content-length") || "0");
+    if (declaredLength > MAX_PROXIED_TEXT_FILE_BYTES) {
+      throw new Error("file is larger than the bridge limit");
+    }
+    const buffer = await response.arrayBuffer();
+    if (buffer.byteLength > MAX_PROXIED_TEXT_FILE_BYTES) {
+      throw new Error("file is larger than the bridge limit");
+    }
+
+    return {
+      contentType: String(response.headers.get("content-type") || ""),
+      bytesBase64: bytesToBase64(new Uint8Array(buffer)),
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function bytesToBase64(bytes) {
+  let binary = "";
+  const chunkSize = 32_768;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+  }
+  return btoa(binary);
+}
 
 chrome.tabs.onActivated.addListener(() => {
   void sendBridgeReady();
@@ -244,7 +449,7 @@ async function handleBrokerMessage(rawMessage) {
         message: `Dispatching prompt to tab ${tab.id} (${source})`,
       });
 
-      await chrome.tabs.sendMessage(tab.id, {
+      await sendPromptToTab(tab.id, {
         type: "AIBRIDGE_RUN_PROMPT",
         id: payload.id,
         context: payload.context,
@@ -267,6 +472,24 @@ async function handleBrokerMessage(rawMessage) {
   });
   
   await handleBrokerMessagePromise;
+}
+
+async function sendPromptToTab(tabId, message) {
+  try {
+    await chrome.tabs.sendMessage(tabId, message);
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    if (!/receiving end does not exist|could not establish connection/i.test(errorMessage)) {
+      throw error;
+    }
+
+    console.info("[AI Bridge] reinjecting content script into stale tab", tabId);
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["src/content.js"],
+    });
+    await chrome.tabs.sendMessage(tabId, message);
+  }
 }
 
 function sendToBroker(payload, options = { queue: true }) {
