@@ -51,8 +51,8 @@ The task has no boot, logon, time, or event triggers. Installation does not
 start it. The first `ai` command after boot performs a health check and starts
 the task with `schtasks /Run`; later commands reuse the same broker process.
 
-Load `extension` as an unpacked Chrome extension after disabling the old
-Makima extension. See `extension/README.md`.
+Load `extension` as an unpacked extension in Chrome or Firefox. See
+`extension/README.md`.
 
 ## Usage
 
