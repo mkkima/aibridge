@@ -4,4 +4,7 @@ __pycache__/
 logs/
 reports/
 *.log
+dist/
+*.xpi
+
 
