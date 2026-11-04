@@ -286,6 +286,27 @@ browserAPI.tabs.onRemoved.addListener(() => {
   void sendBridgeReady();
 });
 
+async function ensureContentScriptInAiTabs() {
+  try {
+    const tabs = await browserAPI.tabs.query({});
+    for (const tab of tabs) {
+      const source = sourceFromUrl(tab.url);
+      if (source && tab.id) {
+        try {
+          await browserAPI.scripting.executeScript({
+            target: { tabId: tab.id },
+            files: ["src/content.js"],
+          });
+        } catch {
+          // Ignore if already injected or inaccessible.
+        }
+      }
+    }
+  } catch (error) {
+    console.warn("[AI Bridge] failed to ensure content scripts", error);
+  }
+}
+
 async function connect() {
   if (
     isConnecting ||
@@ -297,12 +318,6 @@ async function connect() {
 
   clearReconnectTimer();
   isConnecting = true;
-
-  if (!(await isBrokerReady())) {
-    isConnecting = false;
-    scheduleReconnect();
-    return;
-  }
 
   try {
     socket = new WebSocket(BROKER_URL);
@@ -324,6 +339,7 @@ async function connect() {
     isConnecting = false;
     reconnectAttempt = 0;
     startHeartbeat();
+    await ensureContentScriptInAiTabs();
     await sendBridgeReady();
     flushOutboundQueue();
     await sendHeartbeat();

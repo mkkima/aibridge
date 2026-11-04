@@ -48,7 +48,7 @@ class ExtensionTests(unittest.TestCase):
         # Host permissions for broker loopback and target AI services
         host_permissions = set(data.get("host_permissions", []))
         self.assertIn("http://127.0.0.1/*", host_permissions)
-        self.assertIn("ws://127.0.0.1/*", host_permissions)
+        self.assertIn("http://localhost/*", host_permissions)
 
     def test_extension_scripts_exist_and_avoid_raw_chrome_globals(self) -> None:
         self.assertTrue(self.background_js.is_file(), "src/background.js must exist")
