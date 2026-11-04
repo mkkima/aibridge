@@ -18,19 +18,20 @@ let reconnectTimer = undefined;
 let reconnectAttempt = 0;
 let heartbeatTimer = undefined;
 const outboundQueue = [];
+const browserAPI = globalThis.browser || globalThis.chrome;
 
 void connect();
-chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: 0.5 });
+browserAPI.alarms.create(RECONNECT_ALARM, { periodInMinutes: 0.5 });
 
-chrome.runtime.onInstalled.addListener(() => {
+browserAPI.runtime.onInstalled.addListener(() => {
   void connect();
 });
 
-chrome.runtime.onStartup.addListener(() => {
+browserAPI.runtime.onStartup.addListener(() => {
   void connect();
 });
 
-chrome.alarms.onAlarm.addListener((alarm) => {
+browserAPI.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name !== RECONNECT_ALARM) {
     return;
   }
@@ -39,7 +40,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   void sendHeartbeat();
 });
 
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "AIBRIDGE_INSPECT_CHATGPT_FILE") {
     void inspectChatGptFileInMainWorld(message, sender)
       .then((result) => sendResponse({ ok: true, ...result }))
@@ -77,13 +78,26 @@ async function inspectChatGptFileInMainWorld(message, sender) {
     throw new Error("ChatGPT file inspection requires a valid filename");
   }
 
-  const results = await chrome.scripting.executeScript({
-    target: { tabId: sender.tab.id },
-    world: "MAIN",
-    func: inspectChatGptFileState,
-    args: [fileName],
-  });
-  return results?.[0]?.result || {};
+  try {
+    const results = await browserAPI.scripting.executeScript({
+      target: { tabId: sender.tab.id },
+      world: "MAIN",
+      func: inspectChatGptFileState,
+      args: [fileName],
+    });
+    return results?.[0]?.result || {};
+  } catch (error) {
+    try {
+      const results = await browserAPI.scripting.executeScript({
+        target: { tabId: sender.tab.id },
+        func: inspectChatGptFileState,
+        args: [fileName],
+      });
+      return results?.[0]?.result || {};
+    } catch {
+      throw error;
+    }
+  }
 }
 
 function inspectChatGptFileState(fileName) {
@@ -252,17 +266,17 @@ function bytesToBase64(bytes) {
   return btoa(binary);
 }
 
-chrome.tabs.onActivated.addListener(() => {
+browserAPI.tabs.onActivated.addListener(() => {
   void sendBridgeReady();
 });
 
-chrome.tabs.onUpdated.addListener((_tabId, changeInfo) => {
+browserAPI.tabs.onUpdated.addListener((_tabId, changeInfo) => {
   if (changeInfo.status === "complete") {
     void sendBridgeReady();
   }
 });
 
-chrome.tabs.onRemoved.addListener(() => {
+browserAPI.tabs.onRemoved.addListener(() => {
   void sendBridgeReady();
 });
 
@@ -476,7 +490,7 @@ async function handleBrokerMessage(rawMessage) {
 
 async function sendPromptToTab(tabId, message) {
   try {
-    await chrome.tabs.sendMessage(tabId, message);
+    await browserAPI.tabs.sendMessage(tabId, message);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     if (!/receiving end does not exist|could not establish connection/i.test(errorMessage)) {
@@ -484,11 +498,11 @@ async function sendPromptToTab(tabId, message) {
     }
 
     console.info("[AI Bridge] reinjecting content script into stale tab", tabId);
-    await chrome.scripting.executeScript({
+    await browserAPI.scripting.executeScript({
       target: { tabId },
       files: ["src/content.js"],
     });
-    await chrome.tabs.sendMessage(tabId, message);
+    await browserAPI.tabs.sendMessage(tabId, message);
   }
 }
 
@@ -567,7 +581,7 @@ function flushOutboundQueue() {
 }
 
 async function resolveTargetTab(targetSource) {
-  const activeTabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  const activeTabs = await browserAPI.tabs.query({ active: true, currentWindow: true });
   const activeAiTab = activeTabs.find((tab) => {
     const source = sourceFromUrl(tab.url);
     return source && (!targetSource || source === targetSource);
@@ -577,7 +591,7 @@ async function resolveTargetTab(targetSource) {
     return activeAiTab;
   }
 
-  const allTabs = await chrome.tabs.query({});
+  const allTabs = await browserAPI.tabs.query({});
   const aiTab = allTabs.find((tab) => {
     const source = sourceFromUrl(tab.url);
     return source && (!targetSource || source === targetSource);
@@ -591,13 +605,13 @@ async function resolveTargetTab(targetSource) {
 }
 
 async function currentSource() {
-  const activeTabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  const activeTabs = await browserAPI.tabs.query({ active: true, currentWindow: true });
   const activeSource = sourceFromUrl(activeTabs[0]?.url);
   if (activeSource) {
     return activeSource;
   }
 
-  const allTabs = await chrome.tabs.query({});
+  const allTabs = await browserAPI.tabs.query({});
   return sourceFromUrl(allTabs.find((tab) => sourceFromUrl(tab.url))?.url) || "none";
 }
 
@@ -607,7 +621,7 @@ async function currentBridgeStatus() {
 }
 
 async function openSources() {
-  const tabs = await chrome.tabs.query({});
+  const tabs = await browserAPI.tabs.query({});
   const seenSources = new Set();
   for (const tab of tabs) {
     const source = sourceFromUrl(tab.url);

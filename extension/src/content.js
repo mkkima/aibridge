@@ -9,9 +9,11 @@ const CHATGPT_FILE_MAX_BYTES = 4 * 1024 * 1024;
 const CHATGPT_FILE_TOTAL_MAX_BYTES = 6 * 1024 * 1024;
 let lastGeminiResearchReportText = "";
 
+const browserAPI = globalThis.browser || globalThis.chrome;
+
 console.info("[AI Bridge] content script loaded", HOSTNAME, CONTENT_SCRIPT_VERSION);
 
-chrome.runtime.onMessage.addListener((message) => {
+browserAPI.runtime.onMessage.addListener((message) => {
   if (!message || message.type !== "AIBRIDGE_RUN_PROMPT") {
     return false;
   }
@@ -1263,7 +1265,7 @@ async function getLatestChatGptAssistantTextWithFiles() {
 }
 
 async function resolveChatGptFileFromPageState(card, auth) {
-  const result = await chrome.runtime.sendMessage({
+  const result = await browserAPI.runtime.sendMessage({
     type: "AIBRIDGE_INSPECT_CHATGPT_FILE",
     fileName: card.fileName,
   });
@@ -1641,7 +1643,7 @@ async function fetchChatGptFileResource(url, auth) {
     url.origin !== window.location.origin &&
     url.hostname.toLowerCase().endsWith(".oaiusercontent.com")
   ) {
-    const result = await chrome.runtime.sendMessage({
+    const result = await browserAPI.runtime.sendMessage({
       type: "AIBRIDGE_FETCH_CHATGPT_FILE",
       url: url.href,
       accessToken: auth?.accessToken || "",
@@ -3745,7 +3747,7 @@ function delay(ms) {
 }
 
 function emit(payload) {
-  chrome.runtime.sendMessage({
+  browserAPI.runtime.sendMessage({
     type: "AIBRIDGE_COMPLETION_EVENT",
     payload,
   });
