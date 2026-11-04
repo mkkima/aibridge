@@ -21,7 +21,11 @@ const outboundQueue = [];
 const browserAPI = globalThis.browser || globalThis.chrome;
 
 void connect();
-browserAPI.alarms.create(RECONNECT_ALARM, { periodInMinutes: 0.5 });
+try {
+  browserAPI.alarms.create(RECONNECT_ALARM, { periodInMinutes: 1 });
+} catch (error) {
+  console.warn("[AI Bridge] failed to create alarm", error);
+}
 
 browserAPI.runtime.onInstalled.addListener(() => {
   void connect();
@@ -267,11 +271,13 @@ function bytesToBase64(bytes) {
 }
 
 browserAPI.tabs.onActivated.addListener(() => {
+  void connect();
   void sendBridgeReady();
 });
 
 browserAPI.tabs.onUpdated.addListener((_tabId, changeInfo) => {
-  if (changeInfo.status === "complete") {
+  if (changeInfo.status === "complete" || changeInfo.url) {
+    void connect();
     void sendBridgeReady();
   }
 });
@@ -535,7 +541,7 @@ async function isBrokerReady() {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => {
     controller.abort();
-  }, 800);
+  }, 2000);
 
   try {
     const response = await fetch(BROKER_HEALTH_URL, {
