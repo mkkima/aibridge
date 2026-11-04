@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AI Browser Bridge",
-  "version": "0.1.17",
+  "version": "0.1.18",
   "description": "Routes local ai commands to open ChatGPT, Gemini, or Claude tabs.",
   "permissions": ["alarms", "tabs", "scripting"],
   "host_permissions": [
@@ -15,6 +15,7 @@
   ],
   "background": {
     "service_worker": "src/background.js",
+    "scripts": ["src/background.js"],
     "type": "module"
   },
   "content_scripts": [
@@ -31,5 +32,10 @@
   ],
   "action": {
     "default_title": "AI Browser Bridge"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "aibridge@mkkima.github.io"
+    }
   }
 }
