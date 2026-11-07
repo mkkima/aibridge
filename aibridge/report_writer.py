@@ -32,6 +32,16 @@ def save_json_log(state, mode="debate") -> str:
         
     return filepath
 
+def _yaml_title(value: str) -> str:
+    """Render the frontmatter title as a YAML double-quoted scalar.
+
+    Double quotes are removed, as before. The rest is JSON-encoded: a JSON
+    string is a valid YAML double-quoted scalar, so backslashes, line breaks
+    and control characters are escaped instead of corrupting the frontmatter.
+    Ordinary topics produce exactly the same bytes as the old f-string.
+    """
+    return json.dumps(value.replace('"', ''), ensure_ascii=False)
+
 def format_ai_quote(text: str) -> str:
     """Properly formats AI output with blockquotes."""
     if not text:
@@ -48,7 +58,7 @@ def save_markdown_report(state) -> str:
     with open(filepath, 'w', encoding='utf-8') as f:
         # YAML Frontmatter
         f.write("---\n")
-        f.write(f"title: \"{state.topic.replace('\"', '')}\"\n")
+        f.write(f"title: {_yaml_title(state.topic)}\n")
         f.write(f"date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write("type: debate\n")
         f.write("---\n\n")
@@ -94,7 +104,7 @@ def save_parallel_report(topic: str, responses: dict, synthesis: str) -> str:
     with open(filepath, 'w', encoding='utf-8') as f:
         # YAML Frontmatter
         f.write("---\n")
-        f.write(f"title: \"{topic.replace('\"', '')}\"\n")
+        f.write(f"title: {_yaml_title(topic)}\n")
         f.write(f"date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write("type: parallel_consultation\n")
         f.write("---\n\n")

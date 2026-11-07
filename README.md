@@ -81,6 +81,17 @@ default. Prompt bodies are represented by their SHA-256 digest and byte length;
 completed response bodies are stored in full so they survive broker and browser
 restarts. Set `AIBRIDGE_DB_PATH` to use another location.
 
+### Debate reports
+
+`ai debate "<topic>"` runs a multi-round debate across the connected AI tabs and writes two files to `reports/` (created on first use, git-ignored):
+
+- `<YYYY-MM-DD_HH-MM-SS>_debate_<slug>.md`: Markdown report with YAML frontmatter (`title`, `date`, `type: debate`), followed by the problem formalization, round 1 positions, round 2 critiques, synthesis and decision matrix.
+- `<YYYY-MM-DD_HH-MM-SS>_debate_<slug>.json`: the full debate state.
+
+The frontmatter `title` is the topic with double quotes removed, written as a JSON-style double-quoted string, so backslashes and line breaks are escaped and the frontmatter stays valid YAML. Timestamps have one-second resolution: two reports for the same topic in the same second overwrite each other.
+
+A debate sends many long prompts to every participating AI tab (ChatGPT, Claude and Gemini) and consumes model quota. It needs the broker running and those tabs open.
+
 ## Configuration
 
 The broker accepts these environment variables:
@@ -94,6 +105,17 @@ The broker accepts these environment variables:
 - `AIBRIDGE_WS_URL`, `AIBRIDGE_HTTP_URL` for CLI endpoint overrides
 
 The bundled extension currently uses the default loopback ports.
+
+## Development
+
+### Python compatibility and tests
+
+The code must run on Python 3.11, the minimum version `scripts/install.ps1` accepts. Avoid syntax that only Python 3.12+ accepts, such as backslashes or reused quote characters inside f-string `{...}` expressions (PEP 701). Check with:
+
+```
+python -m compileall -q -f aibridge tests scripts
+python -m unittest discover -s tests -v
+```
 
 ## Uninstall
 
