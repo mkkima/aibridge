@@ -476,20 +476,14 @@ async function handleBrokerMessage(rawMessage) {
 
 async function sendPromptToTab(tabId, message) {
   try {
-    await chrome.tabs.sendMessage(tabId, message);
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    if (!/receiving end does not exist|could not establish connection/i.test(errorMessage)) {
-      throw error;
-    }
-
-    console.info("[AI Bridge] reinjecting content script into stale tab", tabId);
     await chrome.scripting.executeScript({
       target: { tabId },
       files: ["src/content.js"],
     });
-    await chrome.tabs.sendMessage(tabId, message);
+  } catch (_error) {
+    // Content script pre-injection may fail on restricted URLs
   }
+  await chrome.tabs.sendMessage(tabId, message);
 }
 
 function sendToBroker(payload, options = { queue: true }) {

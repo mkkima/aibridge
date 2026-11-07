@@ -4,4 +4,8 @@ __pycache__/
 logs/
 reports/
 *.log
-
+AGENTS.md
+agents.md
+prompts/
+Promts/
+promts/

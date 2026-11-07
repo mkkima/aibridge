@@ -1,24 +1,28 @@
-const CONTENT_SCRIPT_VERSION = "2026.08.08-strict-cli-chatgpt-single-insert";
-const HOSTNAME = window.location.hostname;
-const GEMINI_RESEARCH_FINAL_QUIET_MS = 10_000;
-const CLAUDE_DOCUMENT_FETCH_TIMEOUT_MS = 10_000;
-const CLAUDE_DOCUMENT_MAX_BYTES = 4 * 1024 * 1024;
-const CLAUDE_DOCUMENT_TOTAL_MAX_BYTES = 6 * 1024 * 1024;
-const CHATGPT_FILE_FETCH_TIMEOUT_MS = 10_000;
-const CHATGPT_FILE_MAX_BYTES = 4 * 1024 * 1024;
-const CHATGPT_FILE_TOTAL_MAX_BYTES = 6 * 1024 * 1024;
-let lastGeminiResearchReportText = "";
+var CONTENT_SCRIPT_VERSION = "2026.11.07-chatgpt-resilient-file-and-conv-id";
+var HOSTNAME = window.location.hostname;
+var GEMINI_RESEARCH_FINAL_QUIET_MS = 10_000;
+var CLAUDE_DOCUMENT_FETCH_TIMEOUT_MS = 10_000;
+var CLAUDE_DOCUMENT_MAX_BYTES = 4 * 1024 * 1024;
+var CLAUDE_DOCUMENT_TOTAL_MAX_BYTES = 6 * 1024 * 1024;
+var CHATGPT_FILE_FETCH_TIMEOUT_MS = 10_000;
+var CHATGPT_FILE_MAX_BYTES = 4 * 1024 * 1024;
+var CHATGPT_FILE_TOTAL_MAX_BYTES = 6 * 1024 * 1024;
+var lastGeminiResearchReportText = "";
 
 console.info("[AI Bridge] content script loaded", HOSTNAME, CONTENT_SCRIPT_VERSION);
 
-chrome.runtime.onMessage.addListener((message) => {
+if (window.__AIBRIDGE_MESSAGE_LISTENER__) {
+  chrome.runtime.onMessage.removeListener(window.__AIBRIDGE_MESSAGE_LISTENER__);
+}
+window.__AIBRIDGE_MESSAGE_LISTENER__ = (message) => {
   if (!message || message.type !== "AIBRIDGE_RUN_PROMPT") {
     return false;
   }
 
   void runPrompt(message.id, String(message.context || ""));
   return false;
-});
+};
+chrome.runtime.onMessage.addListener(window.__AIBRIDGE_MESSAGE_LISTENER__);
 
 async function runPrompt(id, context) {
   try {
@@ -41,7 +45,7 @@ async function runPrompt(id, context) {
         : source === "chatgpt"
           ? await getLatestChatGptAssistantTextWithFiles()
           : getLatestAssistantText(source);
-      emitStatus(id, source, "content.done", "Fetched latest text");
+      emitStatus(id, source, "content.done", `Fetched latest text (len=${latestText.length}). ${getResponseDebug(source)}`);
       emit({ type: "FINAL", id, source, content: latestText });
       emit({ type: "DONE", id, source });
       return;
@@ -129,6 +133,9 @@ async function streamResponse({ id, source, baselineText, baselineInfo, promptTe
 
   try {
     while (true) {
+      if (!chrome.runtime?.id) {
+        return;
+      }
       const currentText = normalizeText(getLatestAssistantText(source));
       if (currentText) {
         latestText = currentText;
@@ -555,14 +562,98 @@ async function waitForSendButton(source, timeoutMs) {
   return undefined;
 }
 
+function claudeEditor(input) {
+  if (input?.matches?.("div.ProseMirror[contenteditable='true']")) {
+    return input;
+  }
+  return input?.querySelector?.("div.ProseMirror[contenteditable='true']") ||
+    document.querySelector("div.ProseMirror[contenteditable='true']");
+}
+
+function claudeComposer(input) {
+  const editor = claudeEditor(input);
+  if (!editor) return null;
+  return editor.closest("form") ||
+    editor.closest("fieldset") ||
+    editor.closest('[data-testid="chat-input"]') ||
+    editor.closest('[data-testid="composer"]') ||
+    editor.parentElement?.parentElement?.parentElement;
+}
+
+function isSafeClaudeSendButton(button, composer) {
+  if (!(button instanceof HTMLButtonElement)) return false;
+  if (!composer?.contains(button)) return false;
+  if (!isVisible(button)) return false;
+
+  if (button.disabled ||
+      button.getAttribute("aria-disabled") === "true" ||
+      button.getAttribute("inert") !== null) {
+    return false;
+  }
+
+  // Reject every known dropdown/menu trigger.
+  if (button.matches(
+    '[aria-haspopup], [aria-expanded="true"], [data-state="open"], [role="menuitem"]'
+  )) return false;
+
+  const description = [
+    button.getAttribute("aria-label"),
+    button.getAttribute("title"),
+    button.getAttribute("data-testid"),
+    button.textContent
+  ].filter(Boolean).join(" ").trim();
+
+  const forbidden =
+    /haiku|sonnet|opus|model|effort|thinking|medium|fast|tools?|attach|upload|file|menu|dropdown|mic|voice|search|plus|модел|усили|инструмент|файл/i;
+
+  if (forbidden.test(description)) return false;
+
+  const explicitSend =
+    /(^|[\s_-])(send|submit|отправить|отправка)([\s_-]|$)/i.test(description);
+
+  const testId = button.getAttribute("data-testid") || "";
+  const namedSend = /^(send-button|send-message)$/i.test(testId);
+
+  const form = button.closest("form");
+  const submit =
+    button.type === "submit" &&
+    !!form &&
+    form === composer.closest("form");
+
+  return explicitSend || namedSend || submit;
+}
+
+function findClaudeSendButton(input) {
+  const editor = claudeEditor(input);
+  const composer = claudeComposer(editor);
+  if (!editor || !composer) return undefined;
+
+  const selectors = [
+    'button[data-testid="send-button"]',
+    'button[data-testid="send-message"]',
+    'button[aria-label*="send" i]',
+    'button[aria-label*="отправ" i]',
+    'button[title*="send" i]',
+    'button[type="submit"]'
+  ];
+
+  for (const selector of selectors) {
+    const candidates = composer.querySelectorAll(selector);
+    for (const element of candidates) {
+      if (isSafeClaudeSendButton(element, composer)) {
+        return { element, selector };
+      }
+    }
+  }
+  return undefined;
+}
+
 function findSendButton(source) {
+  if (source === "claude") {
+    return findClaudeSendButton(findPromptInput("claude"));
+  }
+
   const selectorsBySource = {
-    claude: [
-      "button[aria-label*='send' i]",
-      "button[aria-label*='отправ' i]",
-      "button[data-testid='send-button']",
-      "button[type='submit']",
-    ],
     chatgpt: [
       "button[data-testid='send-button']",
       "button[aria-label='Send prompt']",
@@ -617,8 +708,8 @@ function findSendButton(source) {
     }
   }
 
-  // Fallback for Gemini and Claude: look for any button near the input that is enabled or is the last button
-  if (source === "gemini" || source === "claude") {
+  // Fallback for Gemini: look for any button near the input that is enabled or is the last button
+  if (source === "gemini") {
     const input = findPromptInput(source);
     if (input) {
       const container = input.closest('fieldset') || input.closest('div:has(button)') || input.parentElement?.parentElement;
@@ -1019,6 +1110,24 @@ function controlLabels(control) {
 }
 
 function dispatchEnter(input) {
+  const editor = claudeEditor(input) || input;
+  if (!editor) return;
+
+  editor.focus();
+
+  if (editor.isContentEditable) {
+    try {
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(editor);
+      range.collapse(false);
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+    } catch {
+      // Ignore selection errors in non-standard frames
+    }
+  }
+
   const eventConfig = {
     key: "Enter",
     code: "Enter",
@@ -1028,16 +1137,101 @@ function dispatchEnter(input) {
     bubbles: true,
     cancelable: true,
     composed: true,
+    ctrlKey: false,
+    shiftKey: false,
+    altKey: false,
+    metaKey: false,
   };
-  input.dispatchEvent(new KeyboardEvent("keydown", eventConfig));
-  input.dispatchEvent(new KeyboardEvent("keypress", eventConfig));
-  input.dispatchEvent(new KeyboardEvent("keyup", eventConfig));
+  editor.dispatchEvent(new KeyboardEvent("keydown", eventConfig));
+  editor.dispatchEvent(new KeyboardEvent("keypress", eventConfig));
+  editor.dispatchEvent(new KeyboardEvent("keyup", eventConfig));
   
-  // Also try dispatching a submit event to the closest form if available
-  const form = input.closest('form');
+  const form = editor.closest('form');
   if (form) {
     form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
   }
+}
+
+function getLatestChatGptAssistantHeading() {
+  const headings = [
+    ...document.querySelectorAll("h1, h2, h3, h4, h5, h6, [class*='sr-only']")
+  ].filter((el) => {
+    const text = (el.textContent || "").trim();
+    return text.startsWith("ChatGPT said");
+  });
+  if (headings.length === 0) return null;
+  const headingElements = headings.map(el => el.closest("h1, h2, h3, h4, h5, h6") || el);
+  const unique = [...new Set(headingElements)];
+  return unique[unique.length - 1];
+}
+
+function findChatGptAssistantFromActions() {
+  const actionButtons = [
+    ...document.querySelectorAll("button[aria-label*='copy' i], button[aria-label*='копир' i], button[data-testid*='copy' i]")
+  ].filter(isVisible);
+  if (actionButtons.length === 0) return null;
+  const lastCopy = actionButtons[actionButtons.length - 1];
+  const turn = lastCopy.closest("[data-testid^='conversation-turn-']") || 
+               lastCopy.closest("div[class*='turn']") ||
+               lastCopy.parentElement?.closest("div:has(p), div:has(span)");
+  return turn || lastCopy.parentElement;
+}
+
+function getLatestChatGptAssistantMessage() {
+  // Strategy 1: Heading nextElementSibling (ChatGPT modern accessible structure)
+  const heading = getLatestChatGptAssistantHeading();
+  if (heading) {
+    const container = heading.nextElementSibling || heading.parentElement;
+    if (container) {
+      const clone = container.cloneNode(true);
+      for (const noise of clone.querySelectorAll(".sr-only, button, nav, form, [role='toolbar'], svg")) {
+        noise.remove();
+      }
+      let text = extractRichResponseMarkdown(clone, "chatgpt") || 
+                 normalizeText(clone.innerText || clone.textContent || "");
+      if (text.startsWith("ChatGPT said:")) {
+        text = text.slice("ChatGPT said:".length).trim();
+      } else if (text.startsWith("ChatGPT said")) {
+        text = text.slice("ChatGPT said".length).trim();
+      }
+      if (text) {
+        return text;
+      }
+    }
+  }
+
+  // Strategy 2: Action bar (Copy / Regenerate buttons below assistant message)
+  const actionRoot = findChatGptAssistantFromActions();
+  if (actionRoot && !isUserMessageNode(actionRoot) && !isPromptComposerNode(actionRoot)) {
+    const clone = actionRoot.cloneNode(true);
+    for (const noise of clone.querySelectorAll("button, nav, form, [role='toolbar'], svg, .sr-only")) {
+      noise.remove();
+    }
+    let text = extractRichResponseMarkdown(clone, "chatgpt") || 
+               normalizeText(clone.innerText || clone.textContent || "");
+    if (text.startsWith("ChatGPT said:")) {
+      text = text.slice("ChatGPT said:".length).trim();
+    } else if (text.startsWith("ChatGPT said")) {
+      text = text.slice("ChatGPT said".length).trim();
+    }
+    if (text && !text.startsWith("You said")) {
+      return text;
+    }
+  }
+
+  // Strategy 3: Main conversational container text split fallback
+  const main = document.querySelector("main") || document.body;
+  const fullText = main.innerText || "";
+  const parts = fullText.split(/ChatGPT said:\s*/i);
+  if (parts.length > 1) {
+    const lastPart = parts[parts.length - 1];
+    const cleaned = lastPart.split(/ChatGPT can make mistakes/i)[0].trim();
+    if (cleaned) {
+      return cleaned;
+    }
+  }
+
+  return "";
 }
 
 function getLatestAssistantText(source) {
@@ -1054,12 +1248,23 @@ function getLatestAssistantText(source) {
       return lastGeminiResearchReportText;
     }
   }
+  if (source === "chatgpt") {
+    const chatgptText = getLatestChatGptAssistantMessage();
+    if (chatgptText) {
+      return chatgptText;
+    }
+  }
 
   const selectorsBySource = {
     chatgpt: [
       "[data-message-author-role='assistant']",
+      "[data-testid^='conversation-turn-']",
+      "[data-turn='assistant']",
+      "[data-message-id]",
       "div.agent-turn",
       ".markdown",
+      ".prose",
+      "article",
     ],
     gemini: [
       "model-response",
@@ -1084,19 +1289,14 @@ function getLatestAssistantText(source) {
     }
 
     for (const node of nodes) {
-      // Very strict user message filter
-      if (
-        node.closest(".font-user-message") || 
-        node.closest("[data-message-author-role='user']") ||
-        node.hasAttribute("data-is-user") ||
-        node.querySelector("[data-message-author-role='user']")
-      ) {
+      // Strict user and composer filter
+      if (isUserMessageNode(node) || isPromptComposerNode(node)) {
         continue;
       }
       
       let textNode = node;
       if (source === "chatgpt") {
-        textNode = node.querySelector(".markdown") || node;
+        textNode = node.querySelector(".markdown") || node.querySelector(".prose") || node;
       } else if (source === "claude") {
         // Try to dig into the content to avoid wrappers that might include user prompts or "responded" text
         textNode = node.querySelector(".prose") || node.querySelector("div.grid-cols-1") || node;
@@ -1116,7 +1316,7 @@ function getLatestAssistantText(source) {
       }
       
       if (text) {
-        candidates.push({ text, top: node.getBoundingClientRect().top, selector });
+        candidates.push({ node, text, top: node.getBoundingClientRect().top, selector });
       }
     }
 
@@ -1126,24 +1326,37 @@ function getLatestAssistantText(source) {
     }
   }
 
+  if (candidates.length === 0 && source === "chatgpt") {
+    const actionRoot = findChatGptAssistantFromActions();
+    if (actionRoot && !isUserMessageNode(actionRoot) && !isPromptComposerNode(actionRoot)) {
+      const text = extractRichResponseMarkdown(actionRoot, "chatgpt") || 
+                   normalizeText(actionRoot.innerText || actionRoot.textContent || "");
+      if (text) {
+        return text;
+      }
+    }
+  }
+
   if (candidates.length === 0) {
     return "";
   }
 
-  candidates.sort((left, right) => left.top - right.top);
+  candidates.sort((left, right) => compareDocumentOrder(left.node, right.node));
   return candidates[candidates.length - 1].text;
 }
 
 async function getLatestChatGptAssistantTextWithFiles() {
+  const directMessage = getLatestChatGptAssistantMessage();
   const root = getLatestChatGptAssistantRoot();
   if (!root) {
-    return "";
+    return directMessage;
   }
 
-  const textRoot = root.querySelector(".markdown") || root;
+  const textRoot = root.querySelector(".markdown") || root.querySelector(".prose") || root;
   const responseText =
     extractRichResponseMarkdown(textRoot, "chatgpt") ||
-    normalizeText(textRoot.innerText || textRoot.textContent || "");
+    normalizeText(textRoot.innerText || textRoot.textContent || "") ||
+    directMessage;
   const cards = collectChatGptTextFileCards(root);
   if (cards.length === 0) {
     return responseText;
@@ -1183,40 +1396,36 @@ async function getLatestChatGptAssistantTextWithFiles() {
     return appendChatGptFiles(responseText, resolvedFiles, []);
   }
 
+  let references = [];
   try {
     auth ||= await getChatGptWebAuth();
-    const references = await fetchCurrentChatGptTurnFileReferences(auth);
-    const usedReferenceIndexes = new Set();
-    const stillUnresolved = [];
+    references = await fetchCurrentChatGptTurnFileReferences(auth);
+    if (!Array.isArray(references)) references = [];
+  } catch (refError) {
+    console.info(
+      "[AI Bridge] conversation lookup failed, falling back to page state",
+      refError instanceof Error ? refError.message : String(refError),
+    );
+    references = [];
+  }
 
-    for (const card of unresolvedCards) {
-      const matchIndex = findChatGptFileReferenceMatch(
+  const usedReferenceIndexes = new Set();
+  const stillUnresolved = [];
+
+  for (const card of unresolvedCards) {
+    let matchIndex = -1;
+    try {
+      matchIndex = findChatGptFileReferenceMatch(
         card,
         references,
         usedReferenceIndexes,
         unresolvedCards.length,
       );
-      if (matchIndex < 0) {
-        try {
-          const pageStateFile = await resolveChatGptFileFromPageState(card, auth);
-          const byteLength = utf8ByteLength(pageStateFile.content);
-          if (
-            byteLength > CHATGPT_FILE_MAX_BYTES ||
-            totalBytes + byteLength > CHATGPT_FILE_TOTAL_MAX_BYTES
-          ) {
-            throw new Error("file is larger than the bridge limit");
-          }
-          resolvedFiles.push({ ...card, ...pageStateFile });
-          totalBytes += byteLength;
-        } catch (error) {
-          stillUnresolved.push({
-            ...card,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-        continue;
-      }
+    } catch {
+      matchIndex = -1;
+    }
 
+    if (matchIndex >= 0 && references[matchIndex]) {
       const reference = references[matchIndex];
       try {
         const content = await fetchChatGptTextFileById(
@@ -1240,26 +1449,43 @@ async function getLatestChatGptAssistantTextWithFiles() {
           fileName: card.fileName || reference.fileName,
           fileId: reference.fileId,
           content,
+          source: "conversation-reference",
         });
         totalBytes += byteLength;
-      } catch (error) {
-        stillUnresolved.push({
-          ...card,
-          error: error instanceof Error ? error.message : String(error),
-        });
+        continue;
+      } catch (refDownloadError) {
+        console.info(
+          "[AI Bridge] reference download failed, trying page state",
+          card.fileName,
+          refDownloadError instanceof Error ? refDownloadError.message : String(refDownloadError),
+        );
       }
     }
 
-    return appendChatGptFiles(responseText, resolvedFiles, stillUnresolved);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.warn("[AI Bridge] failed to read ChatGPT files from conversation", message);
-    return appendChatGptFiles(
-      responseText,
-      resolvedFiles,
-      unresolvedCards.map((card) => ({ ...card, error: message })),
-    );
+    try {
+      const pageStateFile = await resolveChatGptFileFromPageState(card, auth);
+      const byteLength = utf8ByteLength(pageStateFile.content);
+      if (
+        byteLength > CHATGPT_FILE_MAX_BYTES ||
+        totalBytes + byteLength > CHATGPT_FILE_TOTAL_MAX_BYTES
+      ) {
+        throw new Error("file is larger than the bridge limit");
+      }
+      resolvedFiles.push({
+        ...card,
+        ...pageStateFile,
+        source: pageStateFile.source || "page-state",
+      });
+      totalBytes += byteLength;
+    } catch (error) {
+      stillUnresolved.push({
+        ...card,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
+
+  return appendChatGptFiles(responseText, resolvedFiles, stillUnresolved);
 }
 
 async function resolveChatGptFileFromPageState(card, auth) {
@@ -1318,10 +1544,19 @@ async function resolveChatGptFileFromPageState(card, auth) {
 }
 
 function getLatestChatGptAssistantRoot() {
+  const heading = getLatestChatGptAssistantHeading();
+  if (heading?.nextElementSibling) {
+    return heading.nextElementSibling;
+  }
+
   const selectors = [
     "[data-message-author-role='assistant']",
+    "[data-testid^='conversation-turn-']",
+    "[data-turn='assistant']",
     "[data-testid='conversation-turn-assistant']",
+    "[data-message-id]",
     "div.agent-turn",
+    "article",
   ];
   const roots = [];
   for (const selector of selectors) {
@@ -1344,6 +1579,13 @@ function getLatestChatGptAssistantRoot() {
     if (roots.length > 0) {
       break;
     }
+  }
+  if (roots.length === 0) {
+    const actionRoot = findChatGptAssistantFromActions();
+    if (actionRoot && !isUserMessageNode(actionRoot) && !isPromptComposerNode(actionRoot)) {
+      return actionRoot;
+    }
+    return undefined;
   }
   roots.sort(compareDocumentOrder);
   return roots[roots.length - 1];
@@ -1491,7 +1733,7 @@ function extractChatGptTextFileName(value) {
   const supportedExtension =
     "(?:md|markdown|txt|text|json|jsonl|csv|tsv|yaml|yml|xml|html?|css|js|jsx|ts|tsx|py|rs|c|cc|cpp|h|hpp|java|kt|go|rb|php|sh|bash|zsh|ps1|sql|toml|ini|cfg|conf|log)";
   const pattern = new RegExp(
-    `(?:^|[\\\\/\\s(\"'])((?:[^\\\\/\\n\\r\"'()]+?)\\.${supportedExtension})(?=$|[\\s)\"'?#])`,
+    `(?:^|[\\\\/\\s(\"'])((?:[^\\\\/\\s\\n\\r\"'()]+?)\\.${supportedExtension})(?=$|[\\s)\"'?#])`,
     "i",
   );
   const match = text.match(pattern);
@@ -1727,38 +1969,110 @@ async function fetchCurrentChatGptTurnFileReferences(auth) {
     throw new Error("current ChatGPT conversation ID was not found");
   }
 
-  const endpoint = new URL(
-    `/backend-api/conversation/${encodeURIComponent(conversationId)}`,
-    window.location.origin,
-  ).href;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), CHATGPT_FILE_FETCH_TIMEOUT_MS);
-  try {
-    const response = await fetch(endpoint, {
-      method: "GET",
-      credentials: "include",
-      cache: "no-store",
-      headers: chatGptRequestHeaders(auth, "application/json"),
-      signal: controller.signal,
-    });
-    if (!response.ok) {
-      throw new Error(`ChatGPT conversation returned HTTP ${response.status}`);
+  const candidateIds = [conversationId];
+  const lastSegment = (window.location.pathname || "").split("/").filter(Boolean).slice(-1)[0] || "";
+  if (lastSegment) {
+    try {
+      const decodedSegment = decodeURIComponent(lastSegment);
+      if (decodedSegment !== conversationId && !candidateIds.includes(decodedSegment)) {
+        candidateIds.push(decodedSegment);
+      }
+    } catch {
+      if (!candidateIds.includes(lastSegment)) {
+        candidateIds.push(lastSegment);
+      }
     }
-    const payload = await response.json();
-    return getCurrentChatGptTurnFileReferences(payload);
-  } finally {
-    clearTimeout(timeout);
   }
+
+  let lastError = null;
+  for (const cid of candidateIds) {
+    const endpoint = new URL(
+      `/backend-api/conversation/${encodeURIComponent(cid)}`,
+      window.location.origin,
+    ).href;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), CHATGPT_FILE_FETCH_TIMEOUT_MS);
+    try {
+      const response = await fetch(endpoint, {
+        method: "GET",
+        credentials: "include",
+        cache: "no-store",
+        headers: chatGptRequestHeaders(auth, "application/json"),
+        signal: controller.signal,
+      });
+      if (response.ok) {
+        const payload = await response.json();
+        const refs = getCurrentChatGptTurnFileReferences(payload);
+        return Array.isArray(refs) ? refs : [];
+      }
+      lastError = new Error(`ChatGPT conversation returned HTTP ${response.status}`);
+    } catch (err) {
+      lastError = err;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  throw lastError || new Error("Failed to fetch conversation turn references");
 }
 
 function getCurrentChatGptConversationId() {
-  const segments = window.location.pathname.split("/").filter(Boolean);
-  const uuidPattern = /^[0-9a-f]{8}-[0-9a-f-]{20,}$/i;
-  const cIndex = segments.lastIndexOf("c");
-  if (cIndex >= 0 && uuidPattern.test(segments[cIndex + 1] || "")) {
-    return segments[cIndex + 1];
+  const uuidPattern = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+
+  const decode = (value) => {
+    let decoded = String(value ?? "");
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const next = decodeURIComponent(decoded);
+        if (next === decoded) break;
+        decoded = next;
+      } catch {
+        break;
+      }
+    }
+    return decoded;
+  };
+
+  const extractUuid = (value) => decode(value).match(uuidPattern)?.[0] || "";
+  const rawSegments = (window.location.pathname || "").split("/").filter(Boolean);
+  const segments = rawSegments.map(decode);
+
+  // 1. Prefer the identifier directly following the last /c/ segment
+  for (let i = segments.length - 2; i >= 0; i -= 1) {
+    if (segments[i].toLowerCase() === "c") {
+      const id = extractUuid(segments[i + 1]);
+      if (id) return id;
+    }
   }
-  return [...segments].reverse().find((segment) => uuidPattern.test(segment)) || "";
+
+  // 2. Query parameters
+  try {
+    const params = new URLSearchParams(window.location.search || "");
+    const likelyKeys = new Set([
+      "conversationid", "conversation_id", "conversation",
+      "chatid", "chat_id", "cid", "id",
+    ]);
+    for (const [key, value] of params) {
+      if (likelyKeys.has(key.toLowerCase())) {
+        const id = extractUuid(value);
+        if (id) return id;
+      }
+    }
+    for (const value of params.values()) {
+      const id = extractUuid(value);
+      if (id) return id;
+    }
+  } catch {
+    // Ignore URLSearchParams parsing issues
+  }
+
+  // 3. Any path segment from deepest to root
+  for (let i = segments.length - 1; i >= 0; i -= 1) {
+    const id = extractUuid(segments[i]);
+    if (id) return id;
+  }
+
+  return "";
 }
 
 function getCurrentChatGptTurnFileReferences(payload) {
@@ -1965,7 +2279,7 @@ function extractChatGptTextFileNames(value) {
   const supportedExtension =
     "(?:md|markdown|txt|text|json|jsonl|csv|tsv|yaml|yml|xml|html?|css|js|jsx|ts|tsx|py|rs|c|cc|cpp|h|hpp|java|kt|go|rb|php|sh|bash|zsh|ps1|sql|toml|ini|cfg|conf|log)";
   const pattern = new RegExp(
-    `(?:^|[\\\\/\\s(\"'])((?:[^\\\\/\\n\\r\"'()]+?)\\.${supportedExtension})(?=$|[\\s)\"'?#])`,
+    `(?:^|[\\\\/\\s(\"'])((?:[^\\\\/\\s\\n\\r\"'()]+?)\\.${supportedExtension})(?=$|[\\s)\"'?#])`,
     "gi",
   );
   for (const match of text.matchAll(pattern)) {
@@ -2034,7 +2348,13 @@ function appendChatGptFiles(responseText, files, unresolvedCards) {
     );
   }
 
+  const seenUnresolved = new Set();
   for (const card of unresolvedCards) {
+    const key = canonicalClaudeDocumentName(card.fileName || "");
+    if (seenUnresolved.has(key)) {
+      continue;
+    }
+    seenUnresolved.add(key);
     const reason = card.error ? `: ${card.error}` : "";
     sections.push(
       `> AI Bridge could not read the ChatGPT file “${card.fileName || "text file"}”${reason}.`,
@@ -2073,6 +2393,13 @@ function extractRichResponseMarkdown(root, source) {
     .join("\n\n")
     .replace(/\r\n?/g, "\n")
     .trim();
+  if (!markdown) {
+    const clone = root.cloneNode(true);
+    for (const noise of clone.querySelectorAll("button, nav, form, [role='toolbar'], [role='button'], svg")) {
+      noise.remove();
+    }
+    return normalizeText(clone.innerText || clone.textContent || "");
+  }
 
   return markdown;
 }
@@ -2401,45 +2728,56 @@ function cleanupGeminiResearchText(text) {
 async function streamClaudeResponse({ id, baselineInfo, promptText }) {
   const baseline = baselineInfo || captureClaudeBaseline();
   const startedAt = Date.now();
-  let userNode = undefined;
-  let turnRoot = undefined;
-  let observedRoot = undefined;
-  let observer = undefined;
-  let lastDomChangedAt = Date.now();
-  let lastTextChangedAt = Date.now();
+  let activeRoot = null;
   let lastText = "";
   let lastEmittedText = "";
+  let lastTextChangedAt = Date.now();
+  let lastDomChangedAt = Date.now();
+  let sawGenerating = false;
+  let sawFinalActions = false;
   let lastStatusAt = 0;
 
-  const attachObserver = (root) => {
-    if (!root || root === observedRoot) {
-      return;
-    }
-    observer?.disconnect();
-    observedRoot = root;
-    lastDomChangedAt = Date.now();
+  let observer = undefined;
+  try {
     observer = new MutationObserver(() => {
       lastDomChangedAt = Date.now();
     });
-    observer.observe(root.parentElement || root, {
+    observer.observe(document.body, {
       childList: true,
       subtree: true,
       characterData: true,
       attributes: true,
       attributeFilter: ["class", "style", "data-is-streaming", "aria-hidden", "hidden"],
     });
-  };
+  } catch {
+    // Ignore observer setup issues
+  }
 
   try {
     while (true) {
-      if (!userNode) {
-        userNode = findClaudeUserMessageAfter(baseline.lastUserNode, promptText);
+      if (!chrome.runtime?.id) {
+        return;
       }
-      const anchorNode = userNode || baseline.lastTurnRoot || baseline.lastUserNode;
-      turnRoot = anchorNode ? findClaudeTurnRootAfter(anchorNode) : undefined;
-      attachObserver(turnRoot || document.body);
 
-      const currentText = turnRoot ? extractClaudeTurnText(turnRoot) : "";
+      const roots = getClaudeAssistantRoots();
+      const newRoot = roots.find(root => !baseline.roots.has(root));
+      const previousChanged = baseline.lastRoot && (extractClaudeTurnText(baseline.lastRoot) !== baseline.lastText);
+
+      if (newRoot) {
+        activeRoot = newRoot;
+      } else if (!activeRoot && previousChanged) {
+        activeRoot = baseline.lastRoot;
+      } else if (!activeRoot && roots.length > 0) {
+        activeRoot = roots[roots.length - 1];
+      }
+
+      const currentText = activeRoot ? extractClaudeTurnText(activeRoot) : "";
+      const generating = isClaudeGenerating(activeRoot);
+      const finalActions = activeRoot ? hasClaudeFinalActions(activeRoot) : false;
+
+      if (generating) sawGenerating = true;
+      if (finalActions) sawFinalActions = true;
+
       const now = Date.now();
       if (currentText && currentText !== lastText) {
         lastText = currentText;
@@ -2451,15 +2789,7 @@ async function streamClaudeResponse({ id, baselineInfo, promptText }) {
         }
       }
 
-      const streamingState = getClaudeStreamingState(anchorNode);
-      const generating = isClaudeGenerating(anchorNode);
-      const hasFinalActions = turnRoot ? hasClaudeFinalActions(turnRoot) : false;
       const quietForMs = now - Math.max(lastTextChangedAt, lastDomChangedAt);
-      const hasPositiveDoneSignal = streamingState === "false" || hasFinalActions;
-      const shouldFinish = Boolean(lastText) && !generating && (
-        (hasPositiveDoneSignal && quietForMs >= 1_500) ||
-        quietForMs >= 18_000
-      );
 
       if (now - lastStatusAt > 5_000) {
         lastStatusAt = now;
@@ -2467,21 +2797,32 @@ async function streamClaudeResponse({ id, baselineInfo, promptText }) {
           id,
           "claude",
           "content.claude_poll",
-          `text=${lastText.length}, streaming=${streamingState}, generating=${generating}, actions=${hasFinalActions}, quiet=${quietForMs}, version=${CONTENT_SCRIPT_VERSION}`,
+          `text=${lastText.length}, generating=${generating}, actions=${finalActions}, quiet=${quietForMs}, version=${CONTENT_SCRIPT_VERSION}`,
         );
       }
 
-      if (shouldFinish) {
-        await delay(350);
-        const finalRoot = findClaudeTurnRootAfter(anchorNode) || turnRoot;
-        const finalText = finalRoot ? extractClaudeTurnText(finalRoot) : lastText;
-        const content = finalText && finalText.length >= lastText.length ? finalText : lastText;
+      // Completion conditions:
+      const completedByGenerationStop = Boolean(lastText) && sawGenerating && !generating && quietForMs >= 600;
+      const completedByActions = Boolean(lastText) && !generating && (sawFinalActions || finalActions) && quietForMs >= 1_000;
+      const completedByQuietFallback = Boolean(lastText) && !generating && quietForMs >= 3_000;
+
+      if (completedByGenerationStop || completedByActions || completedByQuietFallback) {
+        await delay(250);
+        const content = activeRoot ? (extractClaudeTurnText(activeRoot) || lastText) : lastText;
         emit({ type: "FINAL", id, source: "claude", content });
         emitStatus(id, "claude", "content.final", `Claude final snapshot: ${content.length} chars`);
         return;
       }
 
-      await delay(500);
+      if (now - startedAt > 120_000) {
+        if (lastText) {
+          emit({ type: "FINAL", id, source: "claude", content: lastText });
+          return;
+        }
+        throw new Error("Claude response timed out after 120 seconds");
+      }
+
+      await delay(200);
     }
   } finally {
     observer?.disconnect();
@@ -2489,12 +2830,15 @@ async function streamClaudeResponse({ id, baselineInfo, promptText }) {
 }
 
 function captureClaudeBaseline() {
+  const roots = getClaudeAssistantRoots();
+  const last = roots.length > 0 ? roots[roots.length - 1] : null;
   const lastUserNode = getLastClaudeUserMessageNode();
-  const lastTurnRoot = findClaudeTurnRootAfter(lastUserNode);
   return {
+    roots: new Set(roots),
+    lastRoot: last || null,
+    lastText: last ? extractClaudeTurnText(last) : "",
     lastUserNode,
-    lastTurnRoot,
-    lastText: lastTurnRoot ? extractClaudeTurnText(lastTurnRoot) : "",
+    lastTurnRoot: last || null,
   };
 }
 
@@ -2504,8 +2848,12 @@ function getLatestClaudeAssistantText() {
 }
 
 function getLatestClaudeAssistantRoot() {
+  const roots = getClaudeAssistantRoots();
+  if (roots.length > 0) {
+    return roots[roots.length - 1];
+  }
   const afterLastUserRoot = findClaudeTurnRootAfter(getLastClaudeUserMessageNode());
-  const fallbackRoots = getTopLevelElements(getClaudeAssistantRoots().filter((node) => (
+  const fallbackRoots = getTopLevelElements(roots.filter((node) => (
     !isUserMessageNode(node) &&
     !isPromptComposerNode(node)
   ))).sort(compareDocumentOrder);
@@ -3381,17 +3729,29 @@ function findClaudeTurnRootAfter(userNode) {
 }
 
 function getClaudeAssistantRoots() {
-  const selectors = [
+  const primarySelectors = [
+    '[data-testid="assistant-message"]',
+    '[data-message-author-role="assistant"]',
+  ];
+  for (const selector of primarySelectors) {
+    const nodes = [...document.querySelectorAll(selector)].filter(node => (
+      isVisible(node) && !isUserMessageNode(node) && !isPromptComposerNode(node)
+    ));
+    if (nodes.length > 0) {
+      // Exclude nested duplicates
+      return nodes.filter(root => !nodes.some(other => other !== root && other.contains(root)));
+    }
+  }
+
+  const fallbackSelectors = [
     "[data-is-streaming]",
-    "[data-message-author-role='assistant']",
-    "[data-testid='assistant-message']",
     ".font-claude-message",
     "[class*='font-claude-message']",
     ".prose",
   ];
   const roots = new Set();
 
-  for (const selector of selectors) {
+  for (const selector of fallbackSelectors) {
     let nodes = [];
     try {
       nodes = [...document.querySelectorAll(selector)];
@@ -3403,9 +3763,9 @@ function getClaudeAssistantRoots() {
         continue;
       }
       const root =
-        node.closest("[data-is-streaming]") ||
+        node.closest('[data-testid="assistant-message"]') ||
         node.closest("[data-message-author-role='assistant']") ||
-        node.closest("[data-testid='assistant-message']") ||
+        node.closest("[data-is-streaming]") ||
         node.closest(".font-claude-message") ||
         node.closest("[class*='font-claude-message']") ||
         node;
@@ -3624,6 +3984,12 @@ function getResponseDebug(source) {
     return `Claude response selectors: ${parts.join(", ")}; streaming=${getClaudeStreamingState()}; version=${CONTENT_SCRIPT_VERSION}`;
   }
 
+  if (source === "chatgpt") {
+    const convId = getCurrentChatGptConversationId();
+    const links = [...document.querySelectorAll("a[href*='/c/']")].map(a => a.href).slice(0, 3);
+    return `ChatGPT debug: href=${window.location.href}; pathname=${window.location.pathname}; convId=${convId}; cLinks=${links.join(",")}`;
+  }
+
   if (source !== "gemini") {
     return "";
   }
@@ -3660,6 +4026,7 @@ function isGenerating(source) {
   const selectorsBySource = {
     chatgpt: [
       "button[data-testid='stop-button']",
+      "button[data-testid*='stop' i]",
       "button[aria-label='Stop generating']",
       "button[aria-label='Остановить генерацию']",
       "button[aria-label*='Stop']",
@@ -3727,12 +4094,19 @@ function isPromptComposerNode(element) {
 }
 
 function isUserMessageNode(element) {
+  if (!(element instanceof Element)) {
+    return false;
+  }
   return Boolean(
     element.closest(".font-user-message") ||
     element.closest("[data-message-author-role='user']") ||
     element.closest("[data-testid='user-message']") ||
+    element.closest("article[data-turn='user']") ||
     element.hasAttribute("data-is-user") ||
-    element.querySelector("[data-message-author-role='user']"),
+    element.querySelector?.("[data-message-author-role='user']") ||
+    element.querySelector?.("[data-testid='user-message']") ||
+    element.querySelector?.(".font-user-message") ||
+    element.querySelector?.("article[data-turn='user']"),
   );
 }
 
@@ -3745,10 +4119,20 @@ function delay(ms) {
 }
 
 function emit(payload) {
-  chrome.runtime.sendMessage({
-    type: "AIBRIDGE_COMPLETION_EVENT",
-    payload,
-  });
+  try {
+    if (!chrome.runtime?.id) {
+      return;
+    }
+    const promise = chrome.runtime.sendMessage({
+      type: "AIBRIDGE_COMPLETION_EVENT",
+      payload,
+    });
+    if (promise && typeof promise.catch === "function") {
+      promise.catch(() => {});
+    }
+  } catch (_e) {
+    // Context invalidated when extension is reloaded
+  }
 }
 
 function emitStatus(id, source, stage, message) {
